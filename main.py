@@ -649,11 +649,11 @@ async def audio_stream(
         audio_url = _stream_cache[cache_key]
     else:
         _cache_misses += 1
-        format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+        format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio*/best"
         if format == "mp3":
-            format_selector = "bestaudio[acodec=mp3]/bestaudio/best"
+            format_selector = "bestaudio[acodec=mp3]/bestaudio*/best"
         elif format == "opus":
-            format_selector = "bestaudio[acodec=opus]/bestaudio/best"
+            format_selector = "bestaudio[acodec=opus]/bestaudio*/best"
 
         opts = {
             "quiet": True,
@@ -666,6 +666,17 @@ async def audio_stream(
             audio_url = info.get("url")
             if audio_url:
                 _stream_cache[cache_key] = audio_url
+        except yt_dlp.utils.DownloadError as exc:
+            logger.warning("audio_stream format unavailable, retrying with 'bestaudio*/best': %s", exc)
+            try:
+                fallback_opts = {**opts, "format": "bestaudio*/best"}
+                info = await _run_ydl(fallback_opts, _yt_url(videoId))
+                audio_url = info.get("url")
+                if audio_url:
+                    _stream_cache[cache_key] = audio_url
+            except Exception as fallback_exc:
+                logger.error("audio_stream fallback extract error: %s", fallback_exc)
+                raise HTTPException(status_code=500, detail=str(fallback_exc))
         except Exception as exc:
             logger.error("audio_stream extract error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -737,11 +748,11 @@ async def audio_info(
         return APIResponse(success=True, data=_stream_cache[cache_key])
     _cache_misses += 1
 
-    format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best"
+    format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio*/best"
     if format == "mp3":
-        format_selector = "bestaudio[acodec=mp3]/bestaudio/best"
+        format_selector = "bestaudio[acodec=mp3]/bestaudio*/best"
     elif format == "opus":
-        format_selector = "bestaudio[acodec=opus]/bestaudio/best"
+        format_selector = "bestaudio[acodec=opus]/bestaudio*/best"
 
     opts = {
         "quiet": True,
@@ -762,6 +773,25 @@ async def audio_info(
         ).model_dump()
         _stream_cache[cache_key] = result
         return APIResponse(success=True, data=result)
+    except yt_dlp.utils.DownloadError as exc:
+        logger.warning("audio_info format unavailable, retrying with 'bestaudio*/best': %s", exc)
+        try:
+            fallback_opts = {**opts, "format": "bestaudio*/best"}
+            info = await _run_ydl(fallback_opts, _yt_url(videoId))
+            result = StreamInfo(
+                videoId=videoId,
+                url=info.get("url"),
+                format=info.get("acodec"),
+                quality=info.get("abr"),
+                filesize=info.get("filesize"),
+                ext=info.get("ext"),
+                title=info.get("title"),
+            ).model_dump()
+            _stream_cache[cache_key] = result
+            return APIResponse(success=True, data=result)
+        except Exception as fallback_exc:
+            logger.error("audio_info fallback error: %s", fallback_exc)
+            raise HTTPException(status_code=500, detail=str(fallback_exc))
     except Exception as exc:
         logger.error("audio_info error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
@@ -787,13 +817,13 @@ async def video_stream(
     _cache_misses += 1
 
     quality_map = {
-        "worst": "worstvideo+worstaudio/worst",
-        "360p": "bestvideo[height<=360]+bestaudio/best[height<=360]",
-        "720p": "bestvideo[height<=720]+bestaudio/best[height<=720]",
-        "1080p": "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "best": "bestvideo+bestaudio/best",
+        "worst": "worstvideo*+worstaudio*/worst",
+        "360p": "bestvideo*[height<=360]+bestaudio*/best[height<=360]/best",
+        "720p": "bestvideo*[height<=720]+bestaudio*/best[height<=720]/best",
+        "1080p": "bestvideo*[height<=1080]+bestaudio*/best[height<=1080]/best",
+        "best": "bestvideo*+bestaudio*/best",
     }
-    fmt = quality_map.get(quality, "bestvideo+bestaudio/best")
+    fmt = quality_map.get(quality, "bestvideo*+bestaudio*/best")
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -809,6 +839,21 @@ async def video_stream(
         return RedirectResponse(url=video_url)
     except HTTPException:
         raise
+    except yt_dlp.utils.DownloadError as exc:
+        logger.warning("video_stream format unavailable, retrying with 'best': %s", exc)
+        try:
+            fallback_opts = {**opts, "format": "best"}
+            info = await _run_ydl(fallback_opts, _yt_url(videoId))
+            video_url = info.get("url") or (info.get("requested_formats") or [{}])[0].get("url")
+            if not video_url:
+                raise HTTPException(status_code=404, detail="Video stream URL not found.")
+            _stream_cache[cache_key] = video_url
+            return RedirectResponse(url=video_url)
+        except HTTPException:
+            raise
+        except Exception as fallback_exc:
+            logger.error("video_stream fallback error: %s", fallback_exc)
+            raise HTTPException(status_code=500, detail=str(fallback_exc))
     except Exception as exc:
         logger.error("video_stream error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
