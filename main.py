@@ -177,6 +177,102 @@ async def _run_ydl(opts: dict, url: str) -> dict:
     return await asyncio.to_thread(_extract)
 
 
+# ---------------------------------------------------------------------------
+# Robust format selection – fallback chains
+# ---------------------------------------------------------------------------
+
+# Each list is tried in order; the first format string that works is used.
+# yt-dlp's own "/" operator is used within each string for intra-string fallback.
+
+_AUDIO_DEFAULT_FORMATS = [
+    "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio[ext=mp4]/bestaudio/best",
+    "bestaudio/best",
+    "best",
+]
+
+_AUDIO_MP3_FORMATS = [
+    # MP3 audio is rarely available natively; fall back through aac → m4a → any best audio
+    "bestaudio[acodec=mp3]/bestaudio[acodec=aac]/bestaudio[ext=m4a]/bestaudio/best",
+    "bestaudio/best",
+    "best",
+]
+
+_AUDIO_OPUS_FORMATS = [
+    "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio/best",
+    "bestaudio/best",
+    "best",
+]
+
+_VIDEO_QUALITY_FORMATS: dict[str, list[str]] = {
+    "worst": [
+        "worstvideo*+worstaudio*/worst",
+        "worst",
+    ],
+    "360p": [
+        "bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        "bestvideo[height<=360]+bestaudio/best[height<=360]/best",
+        "best[height<=360]/best",
+        "best",
+    ],
+    "480p": [
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        "bestvideo[height<=480]+bestaudio/best[height<=480]/best",
+        "best[height<=480]/best",
+        "best",
+    ],
+    "720p": [
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "best[height<=720]/best",
+        "best",
+    ],
+    "1080p": [
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "best[height<=1080]/best",
+        "best",
+    ],
+    "best": [
+        "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "bestvideo+bestaudio/best",
+        "best",
+    ],
+}
+
+
+async def _run_ydl_with_fallbacks(base_opts: dict, url: str, format_chain: list[str]) -> dict:
+    """
+    Try each format string in *format_chain* in order.
+    Returns the first successful yt-dlp extraction result.
+    Falls through to the next entry whenever yt-dlp raises a
+    'format not available' error; re-raises immediately for any
+    other DownloadError (e.g. geo-block, private video).
+    """
+    # Phrases that indicate the specific format wasn't found (not a hard failure)
+    _FORMAT_UNAVAILABLE_HINTS = (
+        "Requested format is not available",
+        "requested format is not available",
+        "format is not available",
+        "No video formats found",
+        "no video formats found",
+    )
+
+    last_exc: Exception | None = None
+    for fmt in format_chain:
+        try:
+            opts = {**base_opts, "format": fmt}
+            return await _run_ydl(opts, url)
+        except yt_dlp.utils.DownloadError as exc:
+            exc_str = str(exc)
+            if any(hint in exc_str for hint in _FORMAT_UNAVAILABLE_HINTS):
+                last_exc = exc
+                continue
+            raise
+    raise last_exc or yt_dlp.utils.DownloadError(
+        f"No suitable format found for {url}; tried: {format_chain}"
+    )
+
+
 def _safe_str_views(info: dict) -> str:
     v = info.get("view_count")
     if v is None:
@@ -649,34 +745,19 @@ async def audio_stream(
         audio_url = _stream_cache[cache_key]
     else:
         _cache_misses += 1
-        format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio*/best"
         if format == "mp3":
-            format_selector = "bestaudio[acodec=mp3]/bestaudio*/best"
+            fmt_chain = _AUDIO_MP3_FORMATS
         elif format == "opus":
-            format_selector = "bestaudio[acodec=opus]/bestaudio*/best"
+            fmt_chain = _AUDIO_OPUS_FORMATS
+        else:
+            fmt_chain = _AUDIO_DEFAULT_FORMATS
 
-        opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": format_selector,
-            "skip_download": True,
-        }
+        base_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
         try:
-            info = await _run_ydl(opts, _yt_url(videoId))
+            info = await _run_ydl_with_fallbacks(base_opts, _yt_url(videoId), fmt_chain)
             audio_url = info.get("url")
             if audio_url:
                 _stream_cache[cache_key] = audio_url
-        except yt_dlp.utils.DownloadError as exc:
-            logger.warning("audio_stream format unavailable, retrying with 'bestaudio*/best': %s", exc)
-            try:
-                fallback_opts = {**opts, "format": "bestaudio*/best"}
-                info = await _run_ydl(fallback_opts, _yt_url(videoId))
-                audio_url = info.get("url")
-                if audio_url:
-                    _stream_cache[cache_key] = audio_url
-            except Exception as fallback_exc:
-                logger.error("audio_stream fallback extract error: %s", fallback_exc)
-                raise HTTPException(status_code=500, detail=str(fallback_exc))
         except Exception as exc:
             logger.error("audio_stream extract error: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -697,14 +778,9 @@ async def audio_download(
     Stream audio bytes directly (downloads to client as MP3/WebM).
     Use /audio/stream for Telegram bots (redirect is faster).
     """
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "bestaudio/best",
-        "skip_download": True,
-    }
+    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     try:
-        info = await _run_ydl(opts, _yt_url(videoId))
+        info = await _run_ydl_with_fallbacks(base_opts, _yt_url(videoId), _AUDIO_DEFAULT_FORMATS)
         audio_url = info.get("url")
         title = info.get("title", videoId)
         ext = info.get("ext", "webm")
@@ -748,20 +824,16 @@ async def audio_info(
         return APIResponse(success=True, data=_stream_cache[cache_key])
     _cache_misses += 1
 
-    format_selector = "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio*/best"
     if format == "mp3":
-        format_selector = "bestaudio[acodec=mp3]/bestaudio*/best"
+        fmt_chain = _AUDIO_MP3_FORMATS
     elif format == "opus":
-        format_selector = "bestaudio[acodec=opus]/bestaudio*/best"
+        fmt_chain = _AUDIO_OPUS_FORMATS
+    else:
+        fmt_chain = _AUDIO_DEFAULT_FORMATS
 
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": format_selector,
-        "skip_download": True,
-    }
+    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     try:
-        info = await _run_ydl(opts, _yt_url(videoId))
+        info = await _run_ydl_with_fallbacks(base_opts, _yt_url(videoId), fmt_chain)
         result = StreamInfo(
             videoId=videoId,
             url=info.get("url"),
@@ -773,28 +845,109 @@ async def audio_info(
         ).model_dump()
         _stream_cache[cache_key] = result
         return APIResponse(success=True, data=result)
-    except yt_dlp.utils.DownloadError as exc:
-        logger.warning("audio_info format unavailable, retrying with 'bestaudio*/best': %s", exc)
-        try:
-            fallback_opts = {**opts, "format": "bestaudio*/best"}
-            info = await _run_ydl(fallback_opts, _yt_url(videoId))
-            result = StreamInfo(
-                videoId=videoId,
-                url=info.get("url"),
-                format=info.get("acodec"),
-                quality=info.get("abr"),
-                filesize=info.get("filesize"),
-                ext=info.get("ext"),
-                title=info.get("title"),
-            ).model_dump()
-            _stream_cache[cache_key] = result
-            return APIResponse(success=True, data=result)
-        except Exception as fallback_exc:
-            logger.error("audio_info fallback error: %s", fallback_exc)
-            raise HTTPException(status_code=500, detail=str(fallback_exc))
     except Exception as exc:
         logger.error("audio_info error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 6b. AUDIO QUALITIES – stream + download links for every available quality
+# ---------------------------------------------------------------------------
+
+@app.get("/audio/qualities", tags=["Audio"])
+@limiter.limit("10/second")
+async def audio_qualities(
+    request: Request,
+    videoId: str = Query(..., min_length=5),
+):
+    """
+    Return stream and download links for **all** available audio qualities.
+
+    Each entry in the response contains:
+    - ``quality_label`` – human-readable label (e.g. "128k", "opus-160k")
+    - ``format_id``     – yt-dlp format ID
+    - ``ext``           – container extension
+    - ``acodec``        – audio codec
+    - ``abr``           – average audio bitrate (kbps)
+    - ``filesize``      – estimated file size in bytes (may be null)
+    - ``stream_url``    – direct redirect URL via this API
+    - ``download_url``  – direct download URL via this API
+    """
+    global _cache_hits, _cache_misses
+    cache_key = f"audio_qualities:{videoId}"
+    if cache_key in _info_cache:
+        _cache_hits += 1
+        return APIResponse(success=True, data=_info_cache[cache_key])
+    _cache_misses += 1
+
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    try:
+        info = await _run_ydl(opts, _yt_url(videoId))
+    except Exception as exc:
+        logger.error("audio_qualities extract error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    base = BASE_URL or ""
+    title = info.get("title", videoId)
+    thumbnail = info.get("thumbnail", "")
+
+    # Collect audio-only formats and sort by bitrate descending
+    audio_formats = []
+    seen_ids: set[str] = set()
+    for f in (info.get("formats") or []):
+        fmt_id = f.get("format_id", "")
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        # Audio-only: has a real audio codec and no video track
+        is_audio_only = acodec not in ("none", "") and vcodec in ("none", "")
+        if not is_audio_only:
+            continue
+        if fmt_id in seen_ids:
+            continue
+        seen_ids.add(fmt_id)
+        abr = f.get("abr") or 0
+        ext = f.get("ext", "")
+        quality_label = f"{acodec}-{int(abr)}k" if abr else f"{acodec}-{ext}"
+        audio_formats.append({
+            "quality_label": quality_label,
+            "format_id": fmt_id,
+            "ext": ext,
+            "acodec": acodec,
+            "abr": abr,
+            "filesize": f.get("filesize"),
+            # Direct CDN URL for this specific format (expires after a few hours)
+            "direct_url": f.get("url"),
+            # Stable API URLs – always return best available audio
+            "stream_url": f"{base}/audio/stream?videoId={videoId}",
+            "download_url": f"{base}/audio/download?videoId={videoId}",
+        })
+
+    # Sort by bitrate descending so highest quality comes first
+    audio_formats.sort(key=lambda x: x["abr"] or 0, reverse=True)
+
+    # If no audio-only formats found, fall back to a generic best-audio entry
+    if not audio_formats:
+        audio_formats = [{
+            "quality_label": "best",
+            "format_id": "best",
+            "ext": info.get("ext", ""),
+            "acodec": info.get("acodec", ""),
+            "abr": info.get("abr"),
+            "filesize": info.get("filesize"),
+            "direct_url": info.get("url"),
+            "stream_url": f"{base}/audio/stream?videoId={videoId}",
+            "download_url": f"{base}/audio/download?videoId={videoId}",
+        }]
+
+    result = {
+        "videoId": videoId,
+        "title": title,
+        "thumbnail": thumbnail,
+        "duration": _duration_str(info.get("duration")),
+        "audio_qualities": audio_formats,
+    }
+    _info_cache[cache_key] = result
+    return APIResponse(success=True, data=result)
 
 
 # ---------------------------------------------------------------------------
@@ -806,7 +959,7 @@ async def audio_info(
 async def video_stream(
     request: Request,
     videoId: str = Query(..., min_length=5),
-    quality: str = Query("best", description="best | worst | 360p | 720p | 1080p"),
+    quality: str = Query("best", description="best | worst | 360p | 480p | 720p | 1080p"),
 ):
     """Redirect to a direct video stream URL."""
     global _cache_hits, _cache_misses
@@ -816,22 +969,10 @@ async def video_stream(
         return RedirectResponse(url=_stream_cache[cache_key])
     _cache_misses += 1
 
-    quality_map = {
-        "worst": "worstvideo*+worstaudio*/worst",
-        "360p": "bestvideo*[height<=360]+bestaudio*/best[height<=360]/best",
-        "720p": "bestvideo*[height<=720]+bestaudio*/best[height<=720]/best",
-        "1080p": "bestvideo*[height<=1080]+bestaudio*/best[height<=1080]/best",
-        "best": "bestvideo*+bestaudio*/best",
-    }
-    fmt = quality_map.get(quality, "bestvideo*+bestaudio*/best")
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": fmt,
-        "skip_download": True,
-    }
+    fmt_chain = _VIDEO_QUALITY_FORMATS.get(quality, _VIDEO_QUALITY_FORMATS["best"])
+    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
     try:
-        info = await _run_ydl(opts, _yt_url(videoId))
+        info = await _run_ydl_with_fallbacks(base_opts, _yt_url(videoId), fmt_chain)
         video_url = info.get("url") or (info.get("requested_formats") or [{}])[0].get("url")
         if not video_url:
             raise HTTPException(status_code=404, detail="Video stream URL not found.")
@@ -839,24 +980,120 @@ async def video_stream(
         return RedirectResponse(url=video_url)
     except HTTPException:
         raise
-    except yt_dlp.utils.DownloadError as exc:
-        logger.warning("video_stream format unavailable, retrying with 'best': %s", exc)
-        try:
-            fallback_opts = {**opts, "format": "best"}
-            info = await _run_ydl(fallback_opts, _yt_url(videoId))
-            video_url = info.get("url") or (info.get("requested_formats") or [{}])[0].get("url")
-            if not video_url:
-                raise HTTPException(status_code=404, detail="Video stream URL not found.")
-            _stream_cache[cache_key] = video_url
-            return RedirectResponse(url=video_url)
-        except HTTPException:
-            raise
-        except Exception as fallback_exc:
-            logger.error("video_stream fallback error: %s", fallback_exc)
-            raise HTTPException(status_code=500, detail=str(fallback_exc))
     except Exception as exc:
         logger.error("video_stream error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 7b. VIDEO QUALITIES – stream links for every available quality
+# ---------------------------------------------------------------------------
+
+@app.get("/video/qualities", tags=["Video"])
+@limiter.limit("10/second")
+async def video_qualities(
+    request: Request,
+    videoId: str = Query(..., min_length=5),
+):
+    """
+    Return stream links for **all** available video qualities.
+
+    Each entry contains:
+    - ``quality_label`` – human-readable label (e.g. "720p", "1080p")
+    - ``format_id``     – yt-dlp format ID
+    - ``ext``           – container extension
+    - ``height``        – video height in pixels
+    - ``fps``           – frames per second
+    - ``vcodec``        – video codec
+    - ``acodec``        – audio codec
+    - ``filesize``      – estimated file size in bytes (may be null)
+    - ``stream_url``    – direct redirect URL via this API
+    """
+    global _cache_hits, _cache_misses
+    cache_key = f"video_qualities:{videoId}"
+    if cache_key in _info_cache:
+        _cache_hits += 1
+        return APIResponse(success=True, data=_info_cache[cache_key])
+    _cache_misses += 1
+
+    opts = {"quiet": True, "no_warnings": True, "skip_download": True}
+    try:
+        info = await _run_ydl(opts, _yt_url(videoId))
+    except Exception as exc:
+        logger.error("video_qualities extract error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    base = BASE_URL or ""
+    title = info.get("title", videoId)
+    thumbnail = info.get("thumbnail", "")
+
+    # Collect combined (video+audio) and video-only formats, grouped by height
+    video_formats: list[dict] = []
+    seen_heights: set[int] = set()
+    for f in sorted(
+        (info.get("formats") or []),
+        key=lambda x: (x.get("height") or 0),
+        reverse=True,
+    ):
+        vcodec = f.get("vcodec") or "none"
+        height = f.get("height")
+        if vcodec in ("none", "") or not height:
+            continue
+        if height in seen_heights:
+            continue
+        seen_heights.add(height)
+        # Map height to the nearest quality bucket our /video/stream supports
+        if height <= 360:
+            q_param = "360p"
+        elif height <= 480:
+            q_param = "480p"
+        elif height <= 720:
+            q_param = "720p"
+        elif height <= 1080:
+            q_param = "1080p"
+        else:
+            q_param = "best"
+        video_formats.append({
+            "quality_label": f"{height}p",
+            "format_id": f.get("format_id"),
+            "ext": f.get("ext"),
+            "height": height,
+            "width": f.get("width"),
+            "fps": f.get("fps"),
+            "vcodec": vcodec,
+            "acodec": f.get("acodec") or "none",
+            "filesize": f.get("filesize"),
+            # Direct CDN URL for this specific format (expires after a few hours)
+            "direct_url": f.get("url"),
+            # Stable API URL – resolves to the best format at or below this height
+            "stream_url": f"{base}/video/stream?videoId={videoId}&quality={q_param}",
+        })
+
+    # Always include a "best" entry
+    if not any(e["quality_label"] == "best" for e in video_formats):
+        video_formats.append({
+            "quality_label": "best",
+            "format_id": "best",
+            "ext": info.get("ext"),
+            "height": None,
+            "width": None,
+            "fps": None,
+            "vcodec": None,
+            "acodec": None,
+            "filesize": None,
+            "direct_url": None,
+            "stream_url": f"{base}/video/stream?videoId={videoId}&quality=best",
+        })
+
+    result = {
+        "videoId": videoId,
+        "title": title,
+        "thumbnail": thumbnail,
+        "duration": _duration_str(info.get("duration")),
+        "video_qualities": video_formats,
+    }
+    _info_cache[cache_key] = result
+    return APIResponse(success=True, data=result)
 
 
 # ---------------------------------------------------------------------------
@@ -871,19 +1108,14 @@ async def batch_stream(request: Request, body: BatchStreamRequest):
     Returns a list of {videoId, url, title, ext} objects.
     """
     results = []
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "format": "bestaudio/best",
-        "skip_download": True,
-    }
+    base_opts = {"quiet": True, "no_warnings": True, "skip_download": True}
 
     async def _get_one(vid: str) -> dict:
         cache_key = f"audio_stream:{vid}:best"
         if cache_key in _stream_cache:
             return {"videoId": vid, "url": _stream_cache[cache_key], "cached": True}
         try:
-            info = await _run_ydl(opts, _yt_url(vid))
+            info = await _run_ydl_with_fallbacks(base_opts, _yt_url(vid), _AUDIO_DEFAULT_FORMATS)
             url = info.get("url", "")
             if url:
                 _stream_cache[cache_key] = url
