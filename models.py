@@ -30,6 +30,8 @@ class SearchResult(BaseModel):
     duration_seconds: Optional[int] = None
     thumbnail: Optional[str] = None
     url: Optional[str] = None
+    stream_url: Optional[str] = None
+    download_url: Optional[str] = None
     isLive: bool = False
     views: Optional[str] = None
     explicit: bool = False
