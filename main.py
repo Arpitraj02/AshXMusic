@@ -24,7 +24,7 @@ from typing import Any, Optional
 import yt_dlp
 from cachetools import TTLCache
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -57,6 +57,9 @@ load_dotenv()
 HOST: str = os.getenv("HOST", "0.0.0.0")
 PORT: int = int(os.getenv("PORT", "8000"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "info")
+COOKIES_FILE: str = os.getenv("COOKIES_FILE", "cookies.txt")
+BASE_URL: str = os.getenv("BASE_URL", "").rstrip("/")
+COOKIES_ADMIN_TOKEN: str = os.getenv("COOKIES_ADMIN_TOKEN", "")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
@@ -154,10 +157,21 @@ def _duration_str(seconds: int | None) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
+def _cookies_opts() -> dict:
+    """Return yt-dlp cookie option dict if a valid cookies file is found."""
+    path = COOKIES_FILE
+    if path and os.path.isfile(path):
+        logger.debug("Using cookies file: %s", path)
+        return {"cookiefile": path}
+    return {}
+
+
 async def _run_ydl(opts: dict, url: str) -> dict:
     """Run yt-dlp extraction in a thread to avoid blocking the event loop."""
+    merged_opts = {**opts, **_cookies_opts()}
+
     def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with yt_dlp.YoutubeDL(merged_opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     return await asyncio.to_thread(_extract)
@@ -182,6 +196,9 @@ def _map_ytmusic_result(item: dict) -> SearchResult:
     album_info = item.get("album") or {}
     duration_secs = item.get("duration_seconds")
     thumbnails = item.get("thumbnails") or []
+    base = BASE_URL or ""
+    stream_url = f"{base}/audio/stream?videoId={video_id}" if video_id else None
+    download_url = f"{base}/audio/download?videoId={video_id}" if video_id else None
     return SearchResult(
         videoId=video_id,
         title=item.get("title") or item.get("name") or "",
@@ -191,6 +208,8 @@ def _map_ytmusic_result(item: dict) -> SearchResult:
         duration_seconds=duration_secs,
         thumbnail=_extract_thumbnail(thumbnails) or (_thumb(video_id) if video_id else ""),
         url=_yt_url(video_id) if video_id else "",
+        stream_url=stream_url,
+        download_url=download_url,
         isLive=item.get("isLive", False),
         views=str(item.get("views", "N/A")),
         explicit=item.get("isExplicit", False),
@@ -1489,6 +1508,201 @@ async def video_formats(
     except Exception as exc:
         logger.error("video_formats error: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# 25. COOKIES STATUS & UPLOAD
+# ---------------------------------------------------------------------------
+
+@app.get("/cookies/status", tags=["Cookies"])
+async def cookies_status():
+    """Check whether a cookies file is currently loaded (does not expose contents)."""
+    path = COOKIES_FILE
+    loaded = bool(path and os.path.isfile(path))
+    size = os.path.getsize(path) if loaded else 0
+    return APIResponse(
+        success=True,
+        data={
+            "cookies_loaded": loaded,
+            "cookies_file": path if loaded else None,
+            "file_size_bytes": size,
+            "note": (
+                "Cookies are active – yt-dlp will authenticate with YouTube."
+                if loaded
+                else "No cookies file found. Bot-detection errors may occur. "
+                     "Upload cookies via POST /cookies/upload or place cookies.txt in the app directory."
+            ),
+        },
+    )
+
+
+@app.post("/cookies/upload", tags=["Cookies"])
+async def cookies_upload(
+    request: Request,
+    file: UploadFile = File(..., description="Netscape-format cookies.txt file"),
+    token: str = Query(..., description="Admin token set via COOKIES_ADMIN_TOKEN env var"),
+):
+    """
+    Upload a new Netscape-format cookies.txt file at runtime.
+    The file is saved to the path configured in COOKIES_FILE (default: cookies.txt).
+    Requires the admin token set in the COOKIES_ADMIN_TOKEN environment variable.
+    """
+    if not COOKIES_ADMIN_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail="Cookie upload is disabled. Set COOKIES_ADMIN_TOKEN in the environment to enable it.",
+        )
+    if token != COOKIES_ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token.")
+
+    # Validate the file looks like a Netscape cookies file
+    content = await file.read()
+    text = content.decode("utf-8", errors="replace")
+    if "# Netscape HTTP Cookie File" not in text and "# HTTP Cookie File" not in text:
+        raise HTTPException(
+            status_code=400,
+            detail="File does not appear to be a valid Netscape cookies file. "
+                   "It must contain '# Netscape HTTP Cookie File' in the header.",
+        )
+
+    dest = COOKIES_FILE
+    try:
+        with open(dest, "wb") as fh:
+            fh.write(content)
+        # Invalidate all stream caches so new cookies are used immediately
+        _stream_cache.clear()
+        logger.info("Cookies file updated: %s (%d bytes)", dest, len(content))
+        return APIResponse(
+            success=True,
+            data={
+                "message": "Cookies file uploaded successfully.",
+                "path": dest,
+                "size_bytes": len(content),
+            },
+        )
+    except OSError as exc:
+        logger.error("cookies_upload write error: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Failed to write cookies file: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# 26. REGIONAL RECOMMENDATIONS
+# ---------------------------------------------------------------------------
+
+_REGIONAL_QUERIES: dict[str, dict] = {
+    "in": {
+        "name": "India",
+        "queries": {
+            "bollywood": "bollywood hits 2024",
+            "trending": "trending Indian songs 2024",
+            "punjabi": "top punjabi songs 2024",
+            "tamil": "top tamil songs 2024",
+            "telugu": "top telugu songs 2024",
+            "devotional": "hindi devotional songs",
+        },
+    },
+    "us": {
+        "name": "United States",
+        "queries": {
+            "pop": "top US pop songs 2024",
+            "hiphop": "top US hip hop 2024",
+            "country": "top country songs 2024",
+            "rnb": "top R&B songs 2024",
+        },
+    },
+    "gb": {
+        "name": "United Kingdom",
+        "queries": {
+            "pop": "top UK pop songs 2024",
+            "grime": "top grime songs 2024",
+            "indie": "top UK indie songs 2024",
+        },
+    },
+    "pk": {
+        "name": "Pakistan",
+        "queries": {
+            "trending": "trending Pakistan songs 2024",
+            "coke_studio": "coke studio pakistan",
+            "urdu": "top urdu songs 2024",
+        },
+    },
+    "kp": {
+        "name": "K-Pop / Korea",
+        "queries": {
+            "kpop": "top kpop songs 2024",
+            "trending": "trending korean songs 2024",
+        },
+    },
+}
+
+
+@app.get("/recommendations", tags=["Recommendations"])
+@limiter.limit("10/second")
+async def recommendations(
+    request: Request,
+    region: str = Query("in", description="Region code: in | us | gb | pk | kp"),
+    category: str = Query("trending", description="Category within the region (varies by region)"),
+    limit: int = Query(20, ge=1, le=50),
+):
+    """
+    Get region-based music recommendations.
+    Default region is **India (in)**. Categories vary by region – call
+    `/recommendations/regions` to see all available region/category combinations.
+    """
+    global _cache_hits, _cache_misses
+    region = region.lower()
+    region_data = _REGIONAL_QUERIES.get(region)
+    if not region_data:
+        available = list(_REGIONAL_QUERIES.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown region '{region}'. Available: {available}",
+        )
+
+    queries = region_data["queries"]
+    if category not in queries:
+        available_categories = list(queries.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown category '{category}' for region '{region}'. "
+                   f"Available categories: {available_categories}",
+        )
+    query = queries[category]
+
+    cache_key = f"recommendations:{region}:{category}:{limit}"
+    if cache_key in _search_cache:
+        _cache_hits += 1
+        return APIResponse(success=True, data=_search_cache[cache_key])
+    _cache_misses += 1
+
+    try:
+        results = await asyncio.to_thread(ytmusic.search, query, filter="songs", limit=limit)
+        mapped = [_map_ytmusic_result(r).model_dump() for r in (results or [])]
+        payload = {
+            "region": region,
+            "region_name": region_data["name"],
+            "category": category,
+            "query_used": query,
+            "results": mapped,
+        }
+        _search_cache[cache_key] = payload
+        return APIResponse(success=True, data=payload)
+    except Exception as exc:
+        logger.error("recommendations error: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.get("/recommendations/regions", tags=["Recommendations"])
+async def recommendation_regions():
+    """List all available regions and their categories for /recommendations."""
+    data = {
+        code: {
+            "name": info["name"],
+            "categories": list(info["queries"].keys()),
+        }
+        for code, info in _REGIONAL_QUERIES.items()
+    }
+    return APIResponse(success=True, data=data)
 
 
 # ---------------------------------------------------------------------------

@@ -40,3 +40,8 @@ Thumbs.db
 # Temp / download dirs
 /tmp/
 *.tmp
+
+# Cookies – contain session credentials, never commit
+cookies.txt
+cookies/
+*.cookies
