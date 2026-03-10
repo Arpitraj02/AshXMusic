@@ -1,0 +1,80 @@
+```markdown
+# Master Prompt for AI Agent: Create a Comprehensive No-Auth YouTube Music API for Telegram Music Bot
+
+You are an expert Python developer specializing in FastAPI, yt-dlp, ytmusicapi, and building scalable APIs for Telegram bots. Your task is to generate a **COMPLETE, READY-TO-RUN FastAPI application** that serves as a **vast, no-authentication-required, free-to-use backend API** for a Telegram music bot. This API will use **unofficial, key-free libraries** like `yt-dlp` (for downloading/streaming audio/video), `ytmusicapi` (for YouTube Music searches, details, charts, playlists, etc.), and fallback to YouTube search via yt-dlp if needed.
+
+## Core Requirements:
+- **No API keys, no authentication**: Everything must work out-of-the-box without Google API keys, OAuth, or any paid services. Use only open-source unofficial libraries.
+- **Python 3.10+ with FastAPI**: Use FastAPI for the API server. Include `uvicorn` for running. Make it production-ready with CORS enabled (for Telegram bot webhooks/calls), rate limiting (optional, but nice), and error handling.
+- **Dependencies**: List ALL pip-installable deps in a `requirements.txt`. Core ones: `fastapi`, `uvicorn`, `yt-dlp`, `ytmusicapi`, `pydantic`, `python-multipart` (for file uploads if needed), `aiofiles`, `python-dotenv` (for optional config).
+- **Run Instructions**: Provide a `main.py` with `if __name__ == "__main__": uvicorn.run(...)` and clear setup: `pip install -r requirements.txt && python main.py`.
+- **Streaming Support**: For audio/video, provide **direct streaming endpoints** (not downloads) for Telegram bots to forward streams efficiently. Use yt-dlp's `--audio-format best` or similar for high-quality MP3/Opus.
+- **Caching**: Implement simple in-memory caching (e.g., `cachetools` or Redis-optional) for searches/thumbnails to reduce load.
+- **Error Handling**: Graceful errors with JSON responses (e.g., {"error": "msg"}). Rate limit to 10 req/sec per IP.
+- **CORS**: Allow all origins (`*`) for Telegram bot flexibility.
+- **Swagger Docs**: FastAPI auto-docs at `/docs` for testing.
+
+## Must-Have API Endpoints (Make 30+ endpoints, grouped logically):
+Group them under prefixes like `/search`, `/video`, `/audio`, `/playlist`, `/artist`, `/chart`, `/related`, etc. All responses in JSON with Pydantic models for type safety.
+
+### 1. **Search Endpoints** (Primary for bot):
+   - `GET /search?q={query}&type={song|video|playlist|artist|album}&limit=50` → List of results: `{title, artist, duration, thumbnail, videoId, url, isLive, views, explicit}`.
+   - `GET /search/suggestions?q={query}&limit=10` → Autocomplete/search suggestions (use ytmusicapi.search or yt-dlp).
+   - `GET /search/related?q={query}&limit=20` → Related searches/queries (scrape/derive from ytmusicapi).
+   - `GET /search/trending?category={music|pop|rock|global}&limit=50` → Trending songs/videos.
+   - `GET /search/charts?country={US|IN|GB}&limit=50` → YouTube Music charts via ytmusicapi.
+
+### 2. **Video/Song Details** (Use ytmusicapi for rich metadata):
+   - `GET /video/info?videoId={id}` → `{title, artist, album, duration, thumbnail, lyrics (if avail), description, uploadDate, views, likes, relatedVideos}`.
+   - `GET /video/thumbnail?videoId={id}&quality={maxresdefault|hqdefault|default}` → Redirect URL or base64 data.
+   - `GET /video/lyrics?videoId={id}` → Lyrics if available via ytmusicapi.
+   - `GET /artist/info?browseId={id}&limit=20` → Artist top songs, albums, bio.
+   - `GET /playlist/info?playlistId={id}&limit=50` → Playlist tracks with details.
+   - `GET /album/info?albumId={id}&limit=50` → Album tracks.
+
+### 3. **Download/Stream Endpoints** (Critical for TG bot):
+   - `GET /audio/stream?videoId={id}&format={mp3|opus|best}` → Streams audio directly (Range requests for partial content). Use yt-dlp with `--remux-video mp3` or audio extractor.
+   - `GET /video/stream?videoId={id}&quality={best|worst|360p|720p}` → Video stream.
+   - `GET /audio/download?videoId={id}` → Temp file download (but prefer stream).
+   - `POST /batch/stream` → Body: `{"videoIds": ["id1", "id2"]}` → Streams multiple in a zip or list.
+
+### 4. **YouTube Music Specific (via ytmusicapi)**:
+   - `GET /ytmusic/search?q={query}&limit=50` → YTMusic search.
+   - `GET /ytmusic/home?limit=20` → Home feed: shelves, charts.
+   - `GET /ytmusic/library?type={songs|playlists|artists}` → Simulated library (or recent plays).
+   - `GET /ytmusic/browse?browseId={id}` → Category browsing.
+   - `GET /ytmusic/get_search_suggestions?q={query}` → YTMusic-specific suggestions.
+
+### 5. **Advanced/Utility**:
+   - `GET /related/videos?videoId={id}&limit=20` → Recommended videos.
+   - `GET /random/song?genre={any|pop|hiphop}` → Random popular song.
+   - `GET /top/artists?country={US}&limit=50`.
+   - `GET /genre/browse?genre={pop|rock}&limit=50`.
+   - `GET /live/streams?category={music}&limit=20`.
+   - `POST /search/advanced` → Body: `{"query": "", "filters": {"duration": "short|long", "type": "song"}}`.
+   - Health: `GET /health`, `GET /stats` (uptime, cache hits).
+
+## Response Format:
+- Every endpoint: `{success: true/false, data: {...}, error: "msg if failed"}`.
+- Pydantic models for inputs/outputs (e.g., `SearchResult(BaseModel)`).
+- Thumbnails: Prefer YouTube CDN URLs (fast, no proxy needed).
+- Streams: Set `Content-Type: audio/mpeg` or `video/mp4`, support `Accept-Ranges: bytes`.
+
+## Performance & Best Practices:
+- Async everywhere (`async def`).
+- yt-dlp: Use `ydl_opts = {'quiet': True, 'no_warnings': True, 'format': 'bestaudio/best'}`.
+- ytmusicapi: Init client once globally: `from ytmusicapi import YTMusic; ytmusic = YTMusic()`.
+- Avoid blocking: Run yt-dlp in threads (`asyncio.to_thread`).
+- Logging: Use `logging` module.
+- Config: `.env` for PORT=8000, HOST=0.0.0.0.
+- Docker-ready: Optional `Dockerfile`.
+
+## Output Structure:
+1. **requirements.txt**
+2. **main.py** (full code with all endpoints).
+3. **README.md**: Install, run, test examples (e.g., `curl http://localhost:8000/search?q=taylor%20swift`).
+4. **models.py** (Pydantic schemas).
+5. Test with sample calls showing JSON outputs.
+
+Generate **ONLY the code files**, no explanations unless in README. Ensure it's 100% functional—test mentally for edge cases like invalid IDs, no results.
+```
